@@ -1,0 +1,10 @@
+google-genai
+playwright
+beautifulsoup4
+pydantic
+requests
+python-dotenv
+bson
+ollama
+langgraph
+
