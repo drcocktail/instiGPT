@@ -14,7 +14,7 @@ import re
 from bs4 import BeautifulSoup
 
 from models import ProfessorProfile
-from prompts import GEMINI_ANALYSIS_PROMPT, OLLAMA_EXTRACTION_PROMPT
+from prompts import GEMINI_ANALYSIS_PROMPT, OLLAMA_EXTRACTION_PROMPT, GEMINI_CORRECTION_PROMPT
 
 load_dotenv()
 
@@ -76,14 +76,45 @@ class UniversityCrawler:
         self.page.set_default_timeout(60000)
         logging.info("✅ Browser setup complete")
 
-    def analyze_page_with_gemini(self, objective: str, html_content: str) -> Dict[str, Any]:
-        """Use Gemini to analyze the page and decide the next action."""
-        logging.info("🧠 Analyzing page with Gemini...")
-        prompt = GEMINI_ANALYSIS_PROMPT.format(
-            objective=objective,
-            current_url=self.page.url,
-            html_content=html_content # Removed truncation
-        )
+    def validate_action_plan(self, action_plan: Dict[str, Any]) -> (bool, str):
+        """Validates the action plan from Gemini."""
+        action = action_plan.get("action")
+        args = action_plan.get("args", {})
+
+        if not action:
+            return False, "The 'action' key is missing from the plan."
+
+        if action == "CLICK":
+            if not args.get("selector"):
+                return False, "Action 'CLICK' is missing the required 'selector' argument."
+        
+        if action in ["NAVIGATE_TO_LIST", "EXTRACT_LIST"]:
+            required_keys = ["card_selector", "link_selector", "name_selector", "title_selector"]
+            missing_keys = [key for key in required_keys if not args.get(key)]
+            if missing_keys:
+                return False, f"Action '{action}' is missing required arguments: {', '.join(missing_keys)}."
+        
+        return True, "Plan is valid."
+
+    def analyze_page_with_gemini(self, objective: str, html_content: str, previous_plan: Dict = None, failure_reason: str = None) -> Dict[str, Any]:
+        """Use Gemini to analyze the page and decide the next action. Can also be used for corrections."""
+        if previous_plan:
+            logging.info("🧠 Re-analyzing page with Gemini for a correction...")
+            prompt = GEMINI_CORRECTION_PROMPT.format(
+                objective=objective,
+                current_url=self.page.url,
+                invalid_plan=json.dumps(previous_plan, indent=2),
+                failure_reason=failure_reason,
+                html_content=html_content
+            )
+        else:
+            logging.info("🧠 Analyzing page with Gemini...")
+            prompt = GEMINI_ANALYSIS_PROMPT.format(
+                objective=objective,
+                current_url=self.page.url,
+                html_content=html_content
+            )
+        
         try:
             # Use the new client method to generate content
             response = gemini_client.models.generate_content(
@@ -178,24 +209,38 @@ class UniversityCrawler:
                 logging.info(f"\n--- Step {step_count} ---")
                 
                 html_content = self.page.content()
-                # Save the HTML content for debugging
                 with open(os.path.join("html_logs", f"step_{step_count}_main_page.html"), "w", encoding="utf-8") as f:
                     f.write(html_content)
                 
-                action_plan = self.analyze_page_with_gemini(objective, html_content)
-                
+                action_plan = None
+                for attempt in range(3): # Allow up to 3 attempts for self-correction
+                    if attempt > 0:
+                        action_plan = self.analyze_page_with_gemini(objective, html_content, previous_plan=action_plan, failure_reason=failure_reason)
+                    else:
+                        action_plan = self.analyze_page_with_gemini(objective, html_content)
+                    
+                    is_valid, failure_reason = self.validate_action_plan(action_plan)
+                    if is_valid:
+                        break
+                    else:
+                        logging.warning(f"Attempt {attempt + 1}: Gemini plan is invalid. Reason: {failure_reason}")
+                        if attempt == 2:
+                            logging.error("Gemini failed to provide a valid plan after 3 attempts. Finishing.")
+                            action_plan = {"action": "FINISH", "args": {"reason": "Gemini could not produce a valid plan."}}
+
                 action = action_plan.get("action")
                 args = action_plan.get("args", {})
-
-                if action == "NAVIGATE_TO_LIST":
+                
+                if action == "NAVIGATE_TO_LIST" or action == "EXTRACT_LIST": # Treat EXTRACT_LIST as an alias
                     logging.info("Action: NAVIGATE_TO_LIST")
                     card_selector = args.get("card_selector")
                     link_selector = args.get("link_selector")
                     name_selector = args.get("name_selector")
                     title_selector = args.get("title_selector")
                     
+                    # This check is now redundant because of validate_action_plan, but we keep it as a safeguard
                     if not all([card_selector, link_selector, name_selector, title_selector]):
-                        logging.error("Missing one or more required selectors for NAVIGATE_TO_LIST. Finishing.")
+                        logging.error(f"Missing one or more required selectors for {action} action. Finishing.")
                         break
 
                     professor_cards = self.page.query_selector_all(card_selector)
@@ -270,6 +315,51 @@ class UniversityCrawler:
                         logging.info("No pagination detected. Finishing list navigation.")
                         break
                         
+                elif action == "EXTRACT_LIST":
+                    logging.info("Action: EXTRACT_LIST")
+                    card_selector = args.get("faculty_card_selector")
+                    
+                    if not card_selector:
+                        logging.error("Missing 'faculty_card_selector' for EXTRACT_LIST action. Finishing.")
+                        break
+
+                    professor_cards = self.page.query_selector_all(card_selector)
+                    logging.info(f"Found {len(professor_cards)} professor cards using selector '{card_selector}'.")
+                    
+                    for card in professor_cards:
+                        try:
+                            # Since we don't have pre-defined selectors for name/title/link here,
+                            # we pass the entire card's HTML to Ollama for extraction.
+                            card_html = card.inner_html()
+                            
+                            # Create a placeholder profile. Ollama will fill in the details.
+                            partial_profile = ProfessorProfile(name="Unknown", title="Unknown", profile_url="")
+                            
+                            final_profile = self.extract_faculty_data_with_ollama(card_html, partial_profile)
+                            
+                            if final_profile and final_profile.name != "Unknown":
+                                # If a profile URL was extracted, make it absolute
+                                if final_profile.profile_url:
+                                    final_profile.profile_url = urljoin(self.page.url, final_profile.profile_url)
+                                all_profiles.append(final_profile)
+                        except Exception as e:
+                            logging.error(f"Error processing a professor card: {e}", exc_info=True)
+
+                    # After extracting, handle pagination
+                    next_page_selector = args.get("next_page_selector")
+                    if next_page_selector:
+                        next_button = self.page.query_selector(next_page_selector)
+                        if next_button and next_button.is_visible() and next_button.is_enabled():
+                            logging.info(f"Clicking next page button with selector '{next_page_selector}'...")
+                            next_button.click()
+                            self.page.wait_for_load_state("domcontentloaded")
+                        else:
+                            logging.info("No more next page buttons, or button is not interactive. Finishing.")
+                            break
+                    else:
+                        logging.info("No pagination detected. Finishing list navigation.")
+                        break
+
                 elif action == "EXTRACT_PROFILE":
                     logging.info("Action: EXTRACT_PROFILE")
                     # This case needs to be more robust - what's the name/title?
@@ -283,6 +373,8 @@ class UniversityCrawler:
                 elif action == "CLICK":
                     logging.info(f"Action: CLICK on selector '{args.get('selector')}'")
                     selector = args.get("selector")
+                    
+                    # This check is now redundant because of validate_action_plan, but we keep it as a safeguard
                     if selector:
                         self.page.click(selector)
                         self.page.wait_for_load_state("domcontentloaded")

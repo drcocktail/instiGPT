@@ -70,83 +70,80 @@ Now, create the plan for the given objective and context.
 """
 
 GEMINI_ANALYSIS_PROMPT = """
-You are an expert web crawler agent. Your task is to analyze the HTML of a webpage and determine the best course of action to achieve the user's objective.
+You are a web scraping strategist. You are helping to crawl a university website to extract faculty information.
+
+**Current Objective:** {objective}
+**Current URL:** {current_url}
+
+Analyze the following HTML content and determine the best next action. You should return a JSON object with:
+- "action": One of ["CLICK", "NAVIGATE", "EXTRACT_LIST", "EXTRACT_PROFILE", "FINISH"]
+- "selector": CSS selector for the element to interact with (if action is CLICK)
+- "url": URL to navigate to (if action is NAVIGATE) 
+- "reason": Brief explanation of why this action was chosen
+- "faculty_found": Boolean indicating if faculty profiles are visible on this page
+
+Actions explained:
+- CLICK: Click on a link or button (provide CSS selector)
+- NAVIGATE: Go to a specific URL (provide the URL)
+- EXTRACT_LIST: Extract faculty data from a directory/list page (when multiple faculty profiles are visible)
+- EXTRACT_PROFILE: Extract faculty data from a single faculty member's profile page
+- FINISH: End crawling (when no more useful actions can be taken)
+
+**Instructions:**
+Based on the HTML, decide on the next action. Your response **MUST** be a JSON object with an "action" and "args". The "action" key **MUST** be one of the following strings: 'NAVIGATE_TO_LIST', 'EXTRACT_PROFILE', 'CLICK', or 'FINISH'.
+
+**Possible Actions & Arguments:**
+
+1.  **`NAVIGATE_TO_LIST`**: The current page is a list of faculty members.
+
+HTML Content:
+{html_content}
+"""
+
+GEMINI_CORRECTION_PROMPT = """
+You are an expert web crawler agent. Your previous attempt to create an action plan was invalid. You must analyze your mistake and provide a corrected, valid JSON action plan.
 
 **Objective:** {objective}
 **Current URL:** {current_url}
+
+**Your Previous Invalid Plan:**
+```json
+{invalid_plan}
+```
+
+**Reason it was Invalid:**
+{failure_reason}
+
+**Instructions:**
+1.  Review the reason your last plan failed.
+2.  Re-analyze the HTML content below.
+3.  Provide a new, valid JSON response that corrects the mistake.
+4.  The "action" key **MUST** be one of: 'NAVIGATE_TO_LIST', 'EXTRACT_PROFILE', 'CLICK', or 'FINISH'.
+5.  All actions **MUST** include all of their required arguments. For example, 'CLICK' requires a 'selector'.
 
 **HTML Content:**
 ```html
 {html_content}
 ```
 
-**Instructions:**
-Based on the HTML, decide on the next action. Your response **MUST** be a JSON object with an "action" and "args".
-
-**Possible Actions & Arguments:**
-
-1.  **`NAVIGATE_TO_LIST`**: The current page is a list of faculty members.
-    *   `args`:
-        *   `card_selector`: The CSS selector for the container of each professor/faculty member.
-        *   `link_selector`: The CSS selector for the link to the professor's profile page, relative to the card.
-        *   `name_selector`: The CSS selector for the professor's name, relative to the card.
-        *   `title_selector`: The CSS selector for the professor's title or main role, relative to the card.
-        *   `next_page_selector` (optional): The CSS selector for the "next page" button/link if there is one.
-
-2.  **`EXTRACT_PROFILE`**: The current page is a detailed profile of a single faculty member.
-    *   `args`: {{}} (no arguments needed)
-
-3.  **`CLICK`**: You need to click a link or button to get closer to the faculty list.
-    *   `args`:
-        *   `selector`: The CSS selector for the element to click.
-        *   `reason`: A brief explanation of why you are clicking this element.
-
-4.  **`FINISH`**: The objective has been completed, or you are stuck.
-    *   `args`:
-        *   `reason`: A brief explanation of why you are finishing.
-
-**Example Response for a list page:**
-```json
-{{
-  "action": "NAVIGATE_TO_LIST",
-  "args": {{
-    "card_selector": ".faculty-card",
-    "link_selector": "a.profile-link",
-    "name_selector": "h2.name",
-    "title_selector": "p.title",
-    "next_page_selector": "a.next-page"
-  }}
-}}
-```
-
-**Example Response for a profile page:**
-```
-```
+**Provide a new, valid JSON object.**
 """
 
 OLLAMA_EXTRACTION_PROMPT = """
 You are a machine that only returns JSON. Do not write any text, explanation, or conversational filler. Your entire response must be a single, valid JSON object.
 
-Your task is to extract detailed information about a university professor from the provided HTML and complete the provided JSON object.
+Extract the following information for each faculty member found:
+- name: Full name
+- title: Job title or position
+- email: Email address if available
+- department: Department or school
+- research_interests: List of research areas/interests
+- profile_url: Link to detailed profile if available
+- image_url: Profile photo URL if available
+- phone: Phone number if available
+- office: Office location if available
 
-**Partially Scraped Data (complete this object):**
-```json
-{partial_data}
-```
-
-**Pydantic Model Schema (for reference):**
-```python
-class ProfessorProfile(BaseModel):
-    name: str
-    title: str
-    email: Optional[str] = None
-    profile_url: str
-    research_interests: List[str] = Field(default_factory=list)
-    publications: List[str] = Field(default_factory=list)
-    lab: Optional[str] = None
-    description: Optional[str] = None
-    image_url: Optional[str] = None
-```
+Return a JSON array of faculty objects. If no faculty information is found, return an empty array.
 
 **Page Text Content of the Professor's Profile Page:**
 ```text
@@ -155,7 +152,4 @@ class ProfessorProfile(BaseModel):
 
 **Instructions:**
 1.  Analyze the text to find the missing details for the professor.
-2.  Complete the JSON object provided under "Partially Scraped Data".
-3.  Extract research interests, publications, lab name, a description, and an image URL if available.
-4.  Ensure your final output is ONLY the completed JSON object, conforming exactly to the schema. Do not include any other text.
 """
